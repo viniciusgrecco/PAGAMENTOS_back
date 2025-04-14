@@ -1,53 +1,56 @@
-# repositories/payment_repository.py
-import mercadopago
-from entities.payment import Payment
-from models.payment_model import PaymentModel
 import os
-import json
+import datetime
+from entities.payment import Payment
+from integrations.mercadopago_integration import create_mercadopago_checkout_preference
+from integrations.stripe_integration import create_stripe_checkout_session
+from models.payment_model import PaymentModel
 
 class PaymentRepository:
-    def __init__(self):
-        access_token = os.getenv("ACCESS_TOKEN")
-        print("DEBUG: ACCESS_TOKEN utilizado:", access_token)
-        self.sdk = mercadopago.SDK(access_token)
+    def create_checkout_session(self, payment: Payment, payment_method: str) -> dict:
+        if payment_method.lower() == "pix":
+            success_url = os.getenv("MERCADO_PAGO_SUCCESS_URL", "http://localhost:5173/success")
+            cancel_url = os.getenv("MERCADO_PAGO_CANCEL_URL", "http://localhost:5173/cancel")
+            session_url = create_mercadopago_checkout_preference(
+                amount=payment.amount,
+                currency=payment.currency,
+                description=payment.description,
+                success_url=success_url,
+                cancel_url=cancel_url,
+            )
+            return {"url": session_url}
+        else:
+            payment_record = PaymentModel(
+                amount=payment.amount,
+                currency=payment.currency,
+                description=payment.description,
+                payment_method="stripe",
+                status="pending"
+            )
+            payment_record.save()
 
-    def create_payment(self, payment: Payment) -> PaymentModel:
-        payment_data = {
-            "transaction_amount": payment.transaction_amount,
-            "description": payment.description,
-            "payment_method_id": payment.payment_method_id,
-            "payer": {"email": payment.payer_email},
-        }
+            success_url = os.getenv("STRIPE_SUCCESS_URL", "http://localhost:5173/success")
+            cancel_url = os.getenv("STRIPE_CANCEL_URL", "http://localhost:5173/cancel")
+            amount_cents = int(payment.amount * 100)
 
-        # Se for pagamento com cartão, inclua token e identificação
-        if payment.payment_method_id in ["credit_card", "debit_card"]:
-            if not payment.token or not payment.payer_cpf:
-                raise Exception("Token e CPF são obrigatórios para pagamentos com cartão.")
-            payment_data["token"] = payment.token
-            payment_data["payer"]["identification"] = {
-                "type": "CPF",
-                "number": payment.payer_cpf,
-            }
-        
-        print("DEBUG: Dados enviados para a API Mercado Pago:")
-        print(json.dumps(payment_data, indent=2, ensure_ascii=False))
-        
-        response = self.sdk.payment().create(payment_data)
-        
-        print("DEBUG: Resposta completa da API Mercado Pago:")
-        print(json.dumps(response, indent=2, ensure_ascii=False))
-        
-        # Verificação de erros na resposta
-        if "error" in response or "response" not in response:
-            raise Exception(f"Erro ao criar pagamento: {response}")
-        
-        payment_info = response["response"]
-        if "id" not in payment_info:
-            raise Exception(f"ID do pagamento não encontrado: {payment_info}")
-        
-        return PaymentModel(
-            id=str(payment_info["id"]),
-            status=payment_info["status"],
-            preference_id=str(payment_info["id"]),
-            payment_url=payment_info.get("point_of_interaction", {}).get("transaction_data", {}).get("ticket_url"),
+            metadata = {"internal_payment_id": str(payment_record.id)}
+            session = create_stripe_checkout_session(
+                amount_cents=amount_cents,
+                currency=payment.currency,
+                description=payment.description,
+                success_url=success_url,
+                cancel_url=cancel_url,
+                metadata=metadata
+            )
+
+            payment_record.update(set__stripe_session_id=session["id"])
+
+            return {"url": session.url}
+
+    def update_payment_status(self, payment_id: str, status: str, updated_at=None):
+        if updated_at is None:
+            updated_at = datetime.datetime.utcnow()
+
+        PaymentModel.objects(id=payment_id).update(
+            set__status=status,
+            set__updated_at=updated_at
         )
